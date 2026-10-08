@@ -1,4 +1,4 @@
-name: Verificar disponibilidade da homologação
+name: Verificar disponibilidade do portal e homologação
 on:
   workflow_dispatch:
   schedule:
