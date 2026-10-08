@@ -1,0 +1,105 @@
+name: Preparar e publicar Cloudflare Pages
+on:
+  workflow_dispatch:
+    inputs:
+      publisher_revision:
+        description: Commit completo e aprovado do publicador (40 caracteres)
+        type: string
+        required: true
+      ambiente:
+        description: Homologação mantém aviso e noindex; produção exige versão aprovada
+        type: choice
+        options: [homologacao, producao]
+        default: homologacao
+        required: true
+      publicar:
+        description: Enviar para Cloudflare; desmarcado apenas gera pacote para revisão
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: cloudflare-pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validar referência e ambiente sem executar entrada como comando
+        env:
+          REVISION: ${{ inputs.publisher_revision }}
+          TARGET_ENV: ${{ inputs.ambiente }}
+        run: |
+          node -e 'if(!/^[a-f0-9]{40}$/.test(process.env.REVISION)||!["homologacao","producao"].includes(process.env.TARGET_ENV)) throw Error("Referência ou ambiente inválido")'
+      - name: Baixar publicador aprovado sem credenciais persistentes
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: VictorFBio/sala-situacao-unai-v2
+          ref: ${{ inputs.publisher_revision }}
+          path: publisher
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Recuperar arquivos legados e verificar checksum
+        run: |
+          node --input-type=module <<'NODE'
+          import {writeFile} from 'node:fs/promises';
+          import {createHash} from 'node:crypto';
+          const response=await fetch('https://github.com/VictorFBio/sala-situacao-unai-homologacao/releases/download/base-109d7d5/publicacao-109d7d5.zip',{signal:AbortSignal.timeout(60000)});
+          if(!response.ok) throw Error(`Backup indisponível: ${response.status}`);
+          const data=Buffer.from(await response.arrayBuffer());
+          if(createHash('sha256').update(data).digest('hex')!=='df8ccea778dd09bf2c71eb28997b74c0fb624e4669da1a0322a69364450bab33') throw Error('Checksum divergente');
+          await writeFile('backup.zip',data);
+          NODE
+          unzip -q backup.zip -d legacy
+      - name: Instalar e auditar dependências
+        working-directory: publisher
+        run: |
+          npm ci
+          npm audit --audit-level=high
+      - name: Compilar módulos, verificar dados e preparar arquivos Cloudflare
+        working-directory: publisher
+        env:
+          TARGET_ENV: ${{ inputs.ambiente }}
+        run: |
+          node scripts/compose-site.mjs --legacy=../legacy/dist --base=/ --environment="$TARGET_ENV"
+          node scripts/prepare-cloudflare.mjs
+          cd dist-ecossistema-cloudflare
+          zip -qr ../cloudflare-pages.zip .
+      - name: Guardar pacote para revisão e envio
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cloudflare-package
+          path: publisher/cloudflare-pages.zip
+          retention-days: 3
+          if-no-files-found: error
+  deploy:
+    if: inputs.publicar
+    needs: build
+    runs-on: ubuntu-latest
+    environment: cloudflare-pages
+    steps:
+      - name: Recuperar somente o pacote compilado
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cloudflare-package
+      - name: Extrair arquivos estáticos
+        run: unzip -q cloudflare-pages.zip -d site
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+      - name: Conferir configuração sem imprimir credenciais
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CF_PROJECT: ${{ vars.CLOUDFLARE_PROJECT_NAME }}
+        run: |
+          node -e 'if(!process.env.CF_TOKEN||!/^[a-f0-9]{32}$/.test(process.env.CF_ACCOUNT)||!/^[a-z0-9][a-z0-9-]{0,57}[a-z0-9]$/.test(process.env.CF_PROJECT)) throw Error("Configure token, conta e projeto Cloudflare")'
+      - name: Publicar estático sem executar código dos módulos com token
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.148.0'
+          command: pages deploy site --project-name=${{ vars.CLOUDFLARE_PROJECT_NAME }} --branch=${{ inputs.ambiente == 'producao' && 'main' || 'homologacao' }} --commit-hash=${{ inputs.publisher_revision }}
