@@ -58,10 +58,17 @@ jobs:
         run: |
           npm ci
           npm audit --audit-level=high
+      - name: Preparar GDAL para testar a reprojeção das camadas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdal-bin
       - name: Compilar módulos, verificar dados e preparar arquivos Cloudflare
         working-directory: publisher
         env:
           TARGET_ENV: ${{ inputs.ambiente }}
+          OGR_PATH: ogr2ogr
+          PROJ_DATA: /usr/share/proj
+          GDAL_DATA: /usr/share/gdal
         run: |
           node scripts/compose-site.mjs --legacy=../legacy/dist --base=/ --environment="$TARGET_ENV"
           node scripts/prepare-cloudflare.mjs
